@@ -1,9 +1,15 @@
 # Copyright 2024 Zorxx Software. All rights reserved.
 if(IDF_TARGET)
+    # sys_esp.h is a public header and includes the i2c and uart driver
+    # headers, so those have to be REQUIRES rather than PRIV_REQUIRES —
+    # otherwise anything including ibus.h fails to find them. Naming the
+    # specific drivers rather than the "driver" shim keeps the dependency
+    # honest about what is actually used.
     idf_component_register(SRCS "lib/ibus.c" "lib/sys/esp-idf.c"
                            INCLUDE_DIRS "include"
                            PRIV_INCLUDE_DIRS "lib" "include/ibus"
-                           PRIV_REQUIRES "driver" "esp_timer")
+                           REQUIRES "esp_driver_i2c" "esp_driver_uart"
+                           PRIV_REQUIRES "esp_timer")
     return()
 endif()
 
