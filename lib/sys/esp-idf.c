@@ -6,8 +6,11 @@
 #include "sys/sys_esp.h"
 #include "sys.h"
 #include "helpers.h"
+#include <stdlib.h>  /* malloc, free */
 #include <string.h>  /* memcpy */
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "esp_timer.h"
 
@@ -122,32 +125,66 @@ bool SYS_WEAK i2c_ll_read_reg(i2c_lowlevel_context ctx, uint8_t reg, uint8_t *da
 
 #include <driver/uart.h>
 
-#define SYS_UART_MAX_RX_LENGTH 256
+#define SYS_UART_EVENT_QUEUE_DEPTH 10
 
-typedef struct linux_uart_s
+typedef struct esp_uart_s
 {
    uart_port_t port;
+   QueueHandle_t events;
    uart_ll_rx_handler_fn rx_handler;
    void *rx_cookie;
-} linux_uart_t;
+} esp_uart_t;
 
+/* Received data is handed over one idle-delimited burst at a time.
+
+   The obvious implementation -- read a fixed number of bytes in a loop -- does
+   not work for a protocol whose messages are delimited by silence, because the
+   caller's parser is told when a *callback* happened and not when each byte
+   arrived. Fixed-size reads put the boundaries wherever the driver split the
+   stream, and for a message size that divides the read size the split stays in
+   the same wrong place for as long as the link is up. Waiting on the driver's
+   idle timeout instead means one callback per burst, so the gaps the parser
+   sees are the gaps that were really on the wire. */
 static void uart_ll_rx_task(void *param)
 {
-   linux_uart_t *l = (linux_uart_t *) param;
-   bool done = false;
-   uint8_t buffer[SYS_UART_MAX_RX_LENGTH];
+   esp_uart_t *l = (esp_uart_t *) param;
+   uint8_t buffer[SYS_UART_DEFAULT_RX_BUFFER];
+   uart_event_t event;
 
-   while(!done)
+   for(;;)
    {
-      int result = uart_read_bytes(l->port, buffer, sizeof buffer, pdMS_TO_TICKS(1000));
-      if(result < 0)
+      if(xQueueReceive(l->events, &event, portMAX_DELAY) != pdTRUE)
+         continue;
+
+      switch(event.type)
       {
-         vTaskDelay(pdMS_TO_TICKS(10)); /* prevent tight loops */
-      }
-      else
-      {
-         if(NULL != l->rx_handler)
-            l->rx_handler(buffer, (uint32_t)result, l->rx_cookie);
+         case UART_DATA:
+         {
+            size_t remaining = event.size;
+            while(remaining > 0)
+            {
+               size_t want = (remaining > sizeof buffer) ? sizeof buffer : remaining;
+               int got = uart_read_bytes(l->port, buffer, want, 0);
+               if(got <= 0)
+                  break;
+               remaining -= (size_t) got;
+               if(NULL != l->rx_handler)
+                  l->rx_handler(buffer, (uint32_t) got, l->rx_cookie);
+            }
+            break;
+         }
+
+         case UART_FIFO_OVF:
+         case UART_BUFFER_FULL:
+            /* Whatever is in the buffer is of unknown alignment now. Dropping
+               it costs one message; keeping it costs a parser resynchronisation
+               against data that never made sense. */
+            uart_flush_input(l->port);
+            xQueueReset(l->events);
+            break;
+
+         default:
+            break;
       }
    }
 }
@@ -155,7 +192,7 @@ static void uart_ll_rx_task(void *param)
 uart_lowlevel_context SYS_WEAK uart_ll_init(uint32_t baud, uart_ll_data_bits data_bits, uart_ll_stop_bits stop_bits,
                                             uart_ll_parity parity, uart_lowlevel_config *config)
 {
-   linux_uart_t *l;
+   esp_uart_t *l;
    uart_config_t uart_config = {
       .baud_rate  = baud,
       .parity     = (parity == SYS_UART_PARITY_EVEN) ? UART_PARITY_EVEN :
@@ -167,8 +204,10 @@ uart_lowlevel_context SYS_WEAK uart_ll_init(uint32_t baud, uart_ll_data_bits dat
       .source_clk = UART_SCLK_APB,
       .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
    };
+   uint32_t rx_buffer_len = (config->rx_buffer_len > 0) ? config->rx_buffer_len : SYS_UART_DEFAULT_RX_BUFFER;
+   uint8_t idle_symbols = (config->rx_idle_symbols > 0) ? config->rx_idle_symbols : SYS_UART_DEFAULT_RX_IDLE_SYMBOLS;
 
-   l = (linux_uart_t *) malloc(sizeof *l);
+   l = (esp_uart_t *) malloc(sizeof *l);
    if(NULL == l)
    {
       SERR("[%s] Failed to allocate UART context\n", __func__);
@@ -177,15 +216,22 @@ uart_lowlevel_context SYS_WEAK uart_ll_init(uint32_t baud, uart_ll_data_bits dat
    memset(l, 0, sizeof *l);
    l->port = config->port;
 
-   if(uart_driver_install(config->port, 1024, 1024, 0, NULL, 0) != ESP_OK
+   if(uart_driver_install(config->port, rx_buffer_len, 0, SYS_UART_EVENT_QUEUE_DEPTH, &l->events, 0) != ESP_OK
    || uart_param_config(config->port, &uart_config) != ESP_OK
-   || uart_set_pin(config->port, config->tx_pin, config->rx_pin, -1, -1) != ESP_OK)
+   || uart_set_pin(config->port, config->tx_pin, config->rx_pin, -1, -1) != ESP_OK
+   || uart_set_rx_timeout(config->port, idle_symbols) != ESP_OK)
    {
       SERR("[%s] UART %u configuration failed\n", __func__, config->port);
+      uart_driver_delete(config->port);
+      free(l);  /* was leaked */
       return NULL;
    }
 
-   xTaskCreate(uart_ll_rx_task, "uart_rx", 4096, (void *)l, 5, NULL);
+   xTaskCreate(uart_ll_rx_task, "uart_rx",
+               (config->task_stack > 0) ? config->task_stack : SYS_UART_DEFAULT_TASK_STACK,
+               (void *) l,
+               (config->task_priority > 0) ? config->task_priority : SYS_UART_DEFAULT_TASK_PRIORITY,
+               NULL);
 
    return l;
 }
@@ -200,7 +246,7 @@ bool SYS_WEAK uart_ll_deinit(uart_lowlevel_context ctx)
 
 bool SYS_WEAK uart_ll_set_rx_handler(uart_lowlevel_context ctx, uart_ll_rx_handler_fn handler, void *cookie)
 {
-   linux_uart_t *l = (linux_uart_t *) ctx;
+   esp_uart_t *l = (esp_uart_t *) ctx;
    if(NULL == l)
       return false;
    l->rx_handler = handler;
@@ -210,10 +256,12 @@ bool SYS_WEAK uart_ll_set_rx_handler(uart_lowlevel_context ctx, uart_ll_rx_handl
 
 bool SYS_WEAK uart_ll_send(uart_lowlevel_context ctx, uint8_t *data, uint32_t length)
 {
-   linux_uart_t *l = (linux_uart_t *) ctx;
+   esp_uart_t *l = (esp_uart_t *) ctx;
    if(NULL == l)
       return false;
-   return (uart_write_bytes(l->port, data, length) == ESP_OK);
+   /* uart_write_bytes returns the number of bytes queued, not an esp_err_t, so
+      comparing it against ESP_OK reported every non-empty write as a failure. */
+   return (uart_write_bytes(l->port, (const char *) data, length) == (int) length);
 }
 
 /* ----------------------------------------------------------------------------------------------

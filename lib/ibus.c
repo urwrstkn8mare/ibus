@@ -16,6 +16,13 @@
 #define IBUS_MAX_BUFFER_LENGTH   0x20
 #define IBUS_PROTOCOL_OVERHEAD   3     // Don't include 1-byte length or 2-byte checksum
 
+/* A gap this long between received bytes ends a message. At 115200 baud a byte
+   takes 87 us and the gap between servo messages is about 4 ms, so anything
+   between the two delimits them; 1 ms sits in the middle of that. Without a
+   non-zero value here the parser has no gap to synchronise on and can only
+   recover from a bad lock by failing a checksum. */
+#define IBUS_DEFAULT_RX_TIMEOUT  1000
+
 typedef enum
 {
    IBUS_CMD_SERVO       = 4,
@@ -103,6 +110,19 @@ ibus_context_t ibus_init(uart_lowlevel_config *config)
    ibus_reset_statistics(state);
    for(int idx = 0; idx < IBUS_CHANNEL_COUNT; ++idx)
       ibus_reset_channel(state, idx);
+
+   /* These were documented as configuration but never read out of it, so they
+      were always zero: every byte looked like it followed an over-long gap,
+      which reset the parser constantly and made timeout_count meaningless. */
+   if(NULL != config)
+   {
+      state->rx_timeout = config->rx_timeout;
+      state->timestamp_max = config->timestamp_max;
+   }
+   if(0 == state->rx_timeout)
+      state->rx_timeout = IBUS_DEFAULT_RX_TIMEOUT;
+   if(0 == state->timestamp_max)
+      state->timestamp_max = UINT64_MAX;
 
    #if defined(IBUS_LOWLEVEL_NONE)
    state->lowlevel = NULL;
