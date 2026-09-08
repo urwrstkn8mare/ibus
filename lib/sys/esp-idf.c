@@ -201,7 +201,10 @@ uart_lowlevel_context SYS_WEAK uart_ll_init(uint32_t baud, uart_ll_data_bits dat
       .data_bits  = (data_bits == SYS_UART_DATA_BITS_FIVE) ? UART_DATA_5_BITS :
                     (data_bits == SYS_UART_DATA_BITS_SIX) ? UART_DATA_6_BITS :
                     (data_bits == SYS_UART_DATA_BITS_SEVEN) ? UART_DATA_7_BITS : UART_DATA_8_BITS,
-      .source_clk = UART_SCLK_APB,
+      /* UART_SCLK_APB does not exist on every target -- the ESP32-P4 has no
+         such clock -- and picking a specific source is not this layer's call
+         anyway. DEFAULT resolves to whatever the target actually has. */
+      .source_clk = UART_SCLK_DEFAULT,
       .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
    };
    uint32_t rx_buffer_len = (config->rx_buffer_len > 0) ? config->rx_buffer_len : SYS_UART_DEFAULT_RX_BUFFER;
